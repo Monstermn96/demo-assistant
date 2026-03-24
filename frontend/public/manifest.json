@@ -1,0 +1,16 @@
+{
+  "name": "DemoAssistant",
+  "short_name": "DemoAssistant",
+  "description": "Personal AI assistant demo with notes, calendar, memory, and more",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#6366f1",
+  "icons": [
+    {
+      "src": "/arim.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

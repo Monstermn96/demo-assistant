@@ -1,0 +1,15 @@
+services:
+  demo-assistant:
+    build: /home/eric/projects/demo-assistant
+    container_name: demo-assistant
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - PORT=3093
+    env_file:
+      - .env
+    volumes:
+      - demo-assistant-data:/app/data
+
+volumes:
+  demo-assistant-data:

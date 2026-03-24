@@ -1,0 +1,36 @@
+when:
+  - event: push
+    branch: master
+
+steps:
+  - name: sync-latest
+    image: alpine:latest
+    commands:
+      - apk add --no-cache rsync
+      - rsync -a --delete --exclude='.git' --exclude='node_modules' --exclude='dist' --exclude='frontend/node_modules' --exclude='frontend/dist' --exclude='data' --exclude='backups' ./ /home/eric/projects/demo-assistant/
+
+  - name: setup-services-dir
+    image: alpine:latest
+    commands:
+      - mkdir -p /home/eric/services/webapps/demo-assistant
+      - cp /home/eric/projects/demo-assistant/docker-compose.prod.yml /home/eric/services/webapps/demo-assistant/docker-compose.yml
+      - test -f /home/eric/services/webapps/demo-assistant/.env || cp /home/eric/projects/demo-assistant/.env.example /home/eric/services/webapps/demo-assistant/.env
+
+  - name: backup-db
+    image: docker:cli
+    commands:
+      - mkdir -p /home/eric/projects/demo-assistant/backups
+      - docker cp demo-assistant:/app/data/demo-assistant.db "/home/eric/projects/demo-assistant/backups/demo-assistant-$(date +%Y%m%d-%H%M%S).db" 2>/dev/null || echo "No existing DB to backup"
+
+  - name: deploy
+    image: docker:cli
+    commands:
+      - docker compose -f /home/eric/services/webapps/demo-assistant/docker-compose.yml down 2>/dev/null || true
+      - docker compose -f /home/eric/services/webapps/demo-assistant/docker-compose.yml build --no-cache
+      - docker compose -f /home/eric/services/webapps/demo-assistant/docker-compose.yml up -d --force-recreate
+
+  - name: health-check
+    image: docker:cli
+    commands:
+      - sleep 5
+      - docker inspect --format='{{.State.Status}}' demo-assistant | grep -q running && echo "Health check passed - container is running" || (echo "Health check FAILED" && exit 1)
