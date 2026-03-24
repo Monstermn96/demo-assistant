@@ -38,3 +38,7 @@ Copy `.env.example` to `.env` and fill in values. Key vars:
 | `MEMORY_URL` | arim-memory service URL (optional) |
 | `SECRET_KEY` | JWT signing key |
 | `PORT` | App port (default 3093) |
+
+---
+
+*DemoAssistant is deployed at [demo.bischetsrieder-labs.com](https://demo.bischetsrieder-labs.com)*
