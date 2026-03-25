@@ -1,11 +1,12 @@
 """LLM Proxy: authenticates via X-Friend header, proxies to LM Studio, logs to Nexus."""
 
+import json
 import logging
 import os
-import httpx
 import asyncio
 
-from fastapi import FastAPI, Request, HTTPException, Response
+import httpx
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 
 logging.basicConfig(level=logging.INFO)
@@ -20,30 +21,52 @@ PORT = int(os.environ.get("PORT", "3094"))
 app = FastAPI(title="LLM Proxy", docs_url=None, redoc_url=None)
 
 
-async def _log_to_nexus(friend: str, path: str, body: dict, ip: str | None) -> None:
+async def _log_to_nexus(payload: dict) -> None:
     if not NEXUS_URL or not NEXUS_API_KEY:
         return
-    model = body.get("model", "unknown") if isinstance(body, dict) else "unknown"
-    messages = body.get("messages", []) if isinstance(body, dict) else []
-    payload = {
-        "actor": friend,
-        "event_type": "llm_request",
-        "event_data": {
-            "endpoint": path,
-            "model": model,
-            "messages": messages,
-        },
-        "ip_address": ip,
-    }
     try:
         async with httpx.AsyncClient(timeout=5) as client:
-            await client.post(
+            resp = await client.post(
                 f"{NEXUS_URL}/api/app-auth/usage",
                 json=payload,
                 headers={"X-API-Key": NEXUS_API_KEY, "Content-Type": "application/json"},
             )
+            if resp.status_code != 201:
+                logger.warning("Nexus usage log returned %d: %s", resp.status_code, resp.text[:200])
     except Exception as exc:
-        logger.debug("Nexus log failed (non-critical): %s", exc)
+        logger.warning("Nexus usage log failed: %s", exc)
+
+
+def _build_event(
+    friend: str, path: str, body: dict, ip: str | None,
+    status_code: int | None = None, response_body: str | None = None,
+    error: str | None = None,
+) -> dict:
+    model = body.get("model", "unknown") if isinstance(body, dict) else "unknown"
+    messages = body.get("messages", []) if isinstance(body, dict) else []
+
+    event_data: dict = {
+        "endpoint": path,
+        "model": model,
+        "messages": messages,
+    }
+    if status_code is not None:
+        event_data["status_code"] = status_code
+    if error:
+        event_data["error"] = error
+    if response_body and status_code and status_code >= 400:
+        try:
+            err_json = json.loads(response_body)
+            event_data["error_detail"] = err_json.get("error", {}).get("message", response_body[:500]) if isinstance(err_json.get("error"), dict) else str(err_json.get("error", response_body[:500]))
+        except Exception:
+            event_data["error_detail"] = response_body[:500]
+
+    return {
+        "actor": friend,
+        "event_type": "llm_request",
+        "event_data": event_data,
+        "ip_address": ip,
+    }
 
 
 def _get_client_ip(request: Request) -> str | None:
@@ -70,18 +93,12 @@ async def proxy(path: str, request: Request):
     body_json: dict = {}
     if body_bytes:
         try:
-            import json
             body_json = json.loads(body_bytes)
         except Exception:
             pass
 
     ip = _get_client_ip(request)
 
-    # Fire-and-forget logging for POST requests (chat completions etc.)
-    if request.method == "POST":
-        asyncio.create_task(_log_to_nexus(friend, f"/{path}", body_json, ip))
-
-    # Forward headers, strip hop-by-hop and our custom header
     forward_headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in ("x-friend", "host", "connection", "transfer-encoding")
@@ -93,28 +110,55 @@ async def proxy(path: str, request: Request):
 
     is_stream = body_json.get("stream", False)
 
-    async with httpx.AsyncClient(timeout=None) as client:
-        if is_stream:
-            async def stream_gen():
-                async with client.stream(
-                    request.method,
-                    target_url,
-                    headers=forward_headers,
-                    content=body_bytes,
-                ) as resp:
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
+    if request.method == "POST" and is_stream:
+        async def stream_gen():
+            status = None
+            try:
+                async with httpx.AsyncClient(timeout=None) as client:
+                    async with client.stream(
+                        request.method, target_url,
+                        headers=forward_headers, content=body_bytes,
+                    ) as resp:
+                        status = resp.status_code
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+            except Exception as exc:
+                event = _build_event(friend, f"/{path}", body_json, ip, error=str(exc))
+                asyncio.create_task(_log_to_nexus(event))
+                raise
+            finally:
+                if status is not None:
+                    event = _build_event(friend, f"/{path}", body_json, ip, status_code=status)
+                    asyncio.create_task(_log_to_nexus(event))
 
-            return StreamingResponse(stream_gen(), media_type="text/event-stream")
-        else:
+        return StreamingResponse(stream_gen(), media_type="text/event-stream")
+
+    async with httpx.AsyncClient(timeout=None) as client:
+        try:
             resp = await client.request(
-                request.method,
-                target_url,
-                headers=forward_headers,
-                content=body_bytes,
+                request.method, target_url,
+                headers=forward_headers, content=body_bytes,
             )
+        except Exception as exc:
+            if request.method == "POST":
+                event = _build_event(friend, f"/{path}", body_json, ip, error=str(exc))
+                asyncio.create_task(_log_to_nexus(event))
             return Response(
-                content=resp.content,
-                status_code=resp.status_code,
-                headers=dict(resp.headers),
+                content=json.dumps({"error": f"Upstream error: {exc}"}),
+                status_code=502,
+                media_type="application/json",
             )
+
+        if request.method == "POST":
+            event = _build_event(
+                friend, f"/{path}", body_json, ip,
+                status_code=resp.status_code,
+                response_body=resp.text if resp.status_code >= 400 else None,
+            )
+            asyncio.create_task(_log_to_nexus(event))
+
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+        )
