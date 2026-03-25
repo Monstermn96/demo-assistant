@@ -21,6 +21,19 @@ PORT = int(os.environ.get("PORT", "3094"))
 app = FastAPI(title="LLM Proxy", docs_url=None, redoc_url=None)
 
 
+def _event_type_from_path(path: str, method: str) -> str:
+    p = path.lower().rstrip("/")
+    if "chat/completions" in p:
+        return "llm_chat"
+    if "embeddings" in p or "embedding" in p:
+        return "llm_embedding"
+    if "models" in p and method == "GET":
+        return "llm_models"
+    if "completions" in p:
+        return "llm_completion"
+    return "llm_request"
+
+
 async def _log_to_nexus(payload: dict) -> None:
     if not NEXUS_URL or not NEXUS_API_KEY:
         return
@@ -38,18 +51,27 @@ async def _log_to_nexus(payload: dict) -> None:
 
 
 def _build_event(
-    friend: str, path: str, body: dict, ip: str | None,
+    friend: str, method: str, path: str, body: dict, ip: str | None,
     status_code: int | None = None, response_body: str | None = None,
     error: str | None = None,
 ) -> dict:
-    model = body.get("model", "unknown") if isinstance(body, dict) else "unknown"
-    messages = body.get("messages", []) if isinstance(body, dict) else []
+    model = body.get("model", "") if isinstance(body, dict) else ""
 
     event_data: dict = {
+        "method": method,
         "endpoint": path,
-        "model": model,
-        "messages": messages,
     }
+    if model:
+        event_data["model"] = model
+
+    if isinstance(body, dict):
+        if "messages" in body:
+            event_data["messages"] = body["messages"]
+        if "input" in body:
+            event_data["input"] = body["input"] if isinstance(body["input"], str) else body["input"][:5] if isinstance(body["input"], list) else str(body["input"])[:500]
+        if "prompt" in body:
+            event_data["prompt"] = body["prompt"] if isinstance(body["prompt"], str) else str(body["prompt"])[:500]
+
     if status_code is not None:
         event_data["status_code"] = status_code
     if error:
@@ -57,13 +79,14 @@ def _build_event(
     if response_body and status_code and status_code >= 400:
         try:
             err_json = json.loads(response_body)
-            event_data["error_detail"] = err_json.get("error", {}).get("message", response_body[:500]) if isinstance(err_json.get("error"), dict) else str(err_json.get("error", response_body[:500]))
+            err_obj = err_json.get("error", response_body[:500])
+            event_data["error_detail"] = err_obj.get("message", str(err_obj)[:500]) if isinstance(err_obj, dict) else str(err_obj)[:500]
         except Exception:
             event_data["error_detail"] = response_body[:500]
 
     return {
         "actor": friend,
-        "event_type": "llm_request",
+        "event_type": _event_type_from_path(path, method),
         "event_data": event_data,
         "ip_address": ip,
     }
@@ -98,6 +121,7 @@ async def proxy(path: str, request: Request):
             pass
 
     ip = _get_client_ip(request)
+    method = request.method
 
     forward_headers = {
         k: v for k, v in request.headers.items()
@@ -110,25 +134,25 @@ async def proxy(path: str, request: Request):
 
     is_stream = body_json.get("stream", False)
 
-    if request.method == "POST" and is_stream:
+    if method == "POST" and is_stream:
         async def stream_gen():
             status = None
             try:
                 async with httpx.AsyncClient(timeout=None) as client:
                     async with client.stream(
-                        request.method, target_url,
+                        method, target_url,
                         headers=forward_headers, content=body_bytes,
                     ) as resp:
                         status = resp.status_code
                         async for chunk in resp.aiter_bytes():
                             yield chunk
             except Exception as exc:
-                event = _build_event(friend, f"/{path}", body_json, ip, error=str(exc))
+                event = _build_event(friend, method, f"/{path}", body_json, ip, error=str(exc))
                 asyncio.create_task(_log_to_nexus(event))
                 raise
             finally:
                 if status is not None:
-                    event = _build_event(friend, f"/{path}", body_json, ip, status_code=status)
+                    event = _build_event(friend, method, f"/{path}", body_json, ip, status_code=status)
                     asyncio.create_task(_log_to_nexus(event))
 
         return StreamingResponse(stream_gen(), media_type="text/event-stream")
@@ -136,26 +160,24 @@ async def proxy(path: str, request: Request):
     async with httpx.AsyncClient(timeout=None) as client:
         try:
             resp = await client.request(
-                request.method, target_url,
+                method, target_url,
                 headers=forward_headers, content=body_bytes,
             )
         except Exception as exc:
-            if request.method == "POST":
-                event = _build_event(friend, f"/{path}", body_json, ip, error=str(exc))
-                asyncio.create_task(_log_to_nexus(event))
+            event = _build_event(friend, method, f"/{path}", body_json, ip, error=str(exc))
+            asyncio.create_task(_log_to_nexus(event))
             return Response(
                 content=json.dumps({"error": f"Upstream error: {exc}"}),
                 status_code=502,
                 media_type="application/json",
             )
 
-        if request.method == "POST":
-            event = _build_event(
-                friend, f"/{path}", body_json, ip,
-                status_code=resp.status_code,
-                response_body=resp.text if resp.status_code >= 400 else None,
-            )
-            asyncio.create_task(_log_to_nexus(event))
+        event = _build_event(
+            friend, method, f"/{path}", body_json, ip,
+            status_code=resp.status_code,
+            response_body=resp.text if resp.status_code >= 400 else None,
+        )
+        asyncio.create_task(_log_to_nexus(event))
 
         return Response(
             content=resp.content,
