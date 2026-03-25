@@ -24,6 +24,7 @@ from app.chat.manager import (
 )
 from app.llm.agent import run_agent
 from app.agents.orchestrator import run_orchestrated_agent
+from app.usage.client import log_event, get_client_ip
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -54,7 +55,8 @@ async def chat(
     accept = request.headers.get("accept", "")
     if "text/event-stream" in accept:
         return StreamingResponse(
-            _sse_generator(context, model, user_settings, user.id, conv.id, db, load_config, global_row.reasoning_effort),
+            _sse_generator(context, model, user_settings, user.id, conv.id, db, load_config, global_row.reasoning_effort,
+                           actor=user.username, prompt=body.message, client_ip=get_client_ip(request)),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -84,6 +86,18 @@ async def chat(
     )
     await db.commit()
 
+    log_event(
+        user.username, "chat",
+        event_data={
+            "conversation_id": conv.id,
+            "model": result.get("model", model),
+            "prompt": body.message,
+            "response": result["content"],
+            "tools_used": [e.get("tool") for e in collected_events if e.get("type") == "tool_call"],
+        },
+        ip_address=get_client_ip(request),
+    )
+
     return ChatResponse(
         conversation_id=conv.id,
         message=result["content"],
@@ -91,7 +105,8 @@ async def chat(
     )
 
 
-async def _sse_generator(context, model, user_settings, user_id, conv_id, db, load_config=None, reasoning_effort=None):
+async def _sse_generator(context, model, user_settings, user_id, conv_id, db, load_config=None, reasoning_effort=None,
+                         actor=None, prompt=None, client_ip=None):
     queue: asyncio.Queue = asyncio.Queue()
     collected_events: list[dict] = []
 
@@ -124,6 +139,18 @@ async def _sse_generator(context, model, user_settings, user_id, conv_id, db, lo
                 agent_events=collected_events or None,
             )
             await db.commit()
+            if actor:
+                log_event(
+                    actor, "chat",
+                    event_data={
+                        "conversation_id": conv_id,
+                        "model": result.get("model", model),
+                        "prompt": prompt,
+                        "response": result["content"],
+                        "tools_used": [e.get("tool") for e in collected_events if e.get("type") == "tool_call"],
+                    },
+                    ip_address=client_ip,
+                )
             await queue.put({"type": "done", "conversation_id": conv_id, "model": result.get("model", "")})
         except Exception as e:
             logger.exception("SSE agent error")

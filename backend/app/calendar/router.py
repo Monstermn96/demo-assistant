@@ -1,5 +1,5 @@
 from datetime import date
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -7,6 +7,7 @@ from app.auth.middleware import get_current_user
 from app.calendar.models import BulkDeleteBody, CalendarEventCreate, CalendarEventUpdate, CalendarEventOut
 from app.db.database import get_db
 from app.db.models import User, CalendarEvent
+from app.usage.client import log_event, get_client_ip
 
 router = APIRouter(prefix="/calendar", tags=["calendar"])
 
@@ -53,6 +54,7 @@ async def list_events(
 @router.post("/events", response_model=CalendarEventOut, status_code=201)
 async def create_event(
     body: CalendarEventCreate,
+    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -67,6 +69,7 @@ async def create_event(
     )
     db.add(event)
     await db.flush()
+    log_event(user.username, "calendar_create", event_data={"title": body.title, "start_time": str(body.start_time)}, ip_address=get_client_ip(request))
     return _event_to_out(event)
 
 
@@ -89,6 +92,7 @@ async def get_event(
 async def update_event(
     event_id: int,
     body: CalendarEventUpdate,
+    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -104,12 +108,14 @@ async def update_event(
         setattr(event, field, value)
 
     await db.flush()
+    log_event(user.username, "calendar_update", event_data={"event_id": event_id, "title": event.title}, ip_address=get_client_ip(request))
     return _event_to_out(event)
 
 
 @router.delete("/events/{event_id}")
 async def delete_event(
     event_id: int,
+    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -119,7 +125,9 @@ async def delete_event(
     event = result.scalar_one_or_none()
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
+    title = event.title
     await db.delete(event)
+    log_event(user.username, "calendar_delete", event_data={"event_id": event_id, "title": title}, ip_address=get_client_ip(request))
     return {"success": True, "deleted_id": event_id}
 
 

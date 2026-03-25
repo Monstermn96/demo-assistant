@@ -1,6 +1,6 @@
 import json
 import logging
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -8,6 +8,7 @@ from app.db.database import get_db
 from app.db.models import User, Note
 from app.auth.middleware import get_current_user, get_current_user_flexible
 from app.notes.models import NoteCreate, NoteUpdate, NoteOut, NoteSearch
+from app.usage.client import log_event, get_client_ip
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/notes", tags=["notes"])
@@ -38,6 +39,7 @@ async def list_notes(
 @router.post("", response_model=NoteOut, status_code=201)
 async def create_note(
     body: NoteCreate,
+    request: Request,
     user: User = Depends(get_current_user_flexible),
     db: AsyncSession = Depends(get_db),
 ):
@@ -53,6 +55,7 @@ async def create_note(
 
     db.add(note)
     await db.flush()
+    log_event(user.username, "note_create", event_data={"title": body.title}, ip_address=get_client_ip(request))
     return NoteOut(
         id=note.id,
         title=note.title,
@@ -87,6 +90,7 @@ async def get_note(
 async def update_note(
     note_id: int,
     body: NoteUpdate,
+    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -111,6 +115,7 @@ async def update_note(
             pass
 
     await db.flush()
+    log_event(user.username, "note_update", event_data={"note_id": note_id, "title": note.title}, ip_address=get_client_ip(request))
     return NoteOut(
         id=note.id,
         title=note.title,
@@ -123,6 +128,7 @@ async def update_note(
 @router.delete("/{note_id}")
 async def delete_note(
     note_id: int,
+    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -132,7 +138,9 @@ async def delete_note(
     note = result.scalar_one_or_none()
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
+    title = note.title
     await db.delete(note)
+    log_event(user.username, "note_delete", event_data={"note_id": note_id, "title": title}, ip_address=get_client_ip(request))
     return {"success": True, "deleted_id": note_id}
 
 

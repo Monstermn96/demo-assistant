@@ -2,6 +2,7 @@ import re
 import hashlib
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from app.usage.client import log_event, get_client_ip
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel, field_validator
@@ -91,6 +92,7 @@ async def _get_or_create_local_user(
 @router.post("/login", response_model=TokenResponse)
 async def login(
     body: LoginRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     nexus: NexusClient = Depends(get_nexus_client),
 ):
@@ -102,6 +104,7 @@ async def login(
     user = await _get_or_create_local_user(db, result["user_id"], result["username"])
     await db.commit()
 
+    log_event(user.username, "login", ip_address=request.headers.get("x-forwarded-for", request.client.host if request.client else None))
     return TokenResponse(
         access_token=create_access_token(user.id, nexus_session=result["session_token"]),
         refresh_token=create_refresh_token(user.id, nexus_session=result["session_token"]),
@@ -111,6 +114,7 @@ async def login(
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 async def register(
     body: RegisterRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     nexus: NexusClient = Depends(get_nexus_client),
 ):
@@ -124,6 +128,7 @@ async def register(
     user = await _get_or_create_local_user(db, result["user_id"], result["username"])
     await db.commit()
 
+    log_event(user.username, "register", ip_address=get_client_ip(request))
     return TokenResponse(
         access_token=create_access_token(user.id, nexus_session=result["session_token"]),
         refresh_token=create_refresh_token(user.id, nexus_session=result["session_token"]),
@@ -195,6 +200,7 @@ async def guest_login(
     user = await _get_or_create_guest_user(db, ip)
     await db.commit()
 
+    log_event(user.username, "guest_login", event_data={"user_agent": user_agent}, ip_address=ip)
     return TokenResponse(
         access_token=create_access_token(user.id),
         refresh_token=create_refresh_token(user.id),
