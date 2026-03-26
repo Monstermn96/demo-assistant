@@ -310,6 +310,18 @@ async def websocket_chat(ws: WebSocket):
                         agent_events=collected_events or None,
                     )
                     await db.commit()
+                    ws_user_err = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+                    log_event(
+                        ws_user_err.username if ws_user_err else str(user_id), "chat",
+                        event_data={
+                            "conversation_id": conv.id,
+                            "model": effective_model,
+                            "prompt": message,
+                            "response": content,
+                            "error": str(agent_err),
+                            "transport": "websocket",
+                        },
+                    )
                     await ws.send_json({"type": "error", "content": str(agent_err), "conversation_id": conv.id})
                     await ws.send_json({"type": "done", "conversation_id": conv.id, "model": effective_model or ""})
                     continue
@@ -321,6 +333,20 @@ async def websocket_chat(ws: WebSocket):
                     agent_events=collected_events or None,
                 )
                 await db.commit()
+
+                ws_user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+                ws_username = ws_user.username if ws_user else str(user_id)
+                log_event(
+                    ws_username, "chat",
+                    event_data={
+                        "conversation_id": conv.id,
+                        "model": result.get("model", effective_model),
+                        "prompt": message,
+                        "response": saved_content,
+                        "tools_used": [e.get("tool") for e in collected_events if e.get("type") == "tool_call"],
+                        "transport": "websocket",
+                    },
+                )
 
                 await ws.send_json({
                     "type": "done",
